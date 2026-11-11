@@ -42,6 +42,8 @@
     <symbol id="i-speaker" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
     <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></symbol>
+    <symbol id="i-reader" viewBox="0 0 24 24"><path d="M5 6h14M5 10h14M5 14h9M5 18h11"/></symbol>
     <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H11v15H5.5A1.5 1.5 0 0 0 4 20.5z"/><path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H13v15h5.5a1.5 1.5 0 0 1 1.5 1.5z"/></symbol>
   </defs>
 </svg>
@@ -91,6 +93,7 @@
     <div class="topbar-in">
       <button type="button" class="icon-btn" id="backBtn" aria-label="Nouveau document"><svg class="i"><use href="#i-back"/></svg></button>
       <div class="doc-title grow" id="docTitle"></div>
+      <button type="button" class="icon-btn" id="modeBtn" aria-label="Voir le PDF original" hidden></button>
       <button type="button" class="icon-btn" id="editBtn" aria-label="Corriger le texte"><svg class="i"><use href="#i-edit"/></svg></button>
       <button type="button" class="icon-btn" id="viewBtn" aria-label="Affichage" style="font-family:var(--serif);font-size:17px;font-weight:600">Aa</button>
     </div>
@@ -105,6 +108,9 @@
     <div class="doc-wrap" id="docWrap">
       <div id="marker" aria-hidden="true"></div>
       <article class="doc" id="doc" lang="fr"></article>
+    </div>
+    <div class="pdf-scroll" id="pdfScroll" hidden>
+      <div class="pdf-view" id="pdfView"></div>
     </div>
     <div class="editor" id="editor" hidden>
       <label class="sr" for="editText">Texte à lire</label>
@@ -152,6 +158,44 @@
     <p class="busy-sub" id="busySub"></p>
     <div class="bar indet" id="busyBar"><i></i></div>
     <div class="busy-actions"><button type="button" class="btn ghost small" id="busyCancel">Annuler</button></div>
+  </div>
+</div>
+
+<div class="busy" id="choice" hidden>
+  <div class="busy-card choice-card" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="choiceTitle">
+    <p class="busy-title" id="choiceTitle">Comment veux-tu lire ce PDF ?</p>
+    <div class="choice-opts">
+      <button type="button" class="mode-opt" data-mode="reader">
+        <svg class="thumb" viewBox="0 0 56 70" aria-hidden="true">
+          <rect width="56" height="70" rx="9" style="fill:var(--surface-2)"/>
+          <rect x="9" y="13" width="38" height="5" rx="2.5" style="fill:var(--ink);opacity:.7"/>
+          <rect x="7" y="25" width="19" height="9" rx="3" style="fill:var(--hl)"/>
+          <rect x="9" y="27" width="15" height="5" rx="2.5" style="fill:var(--ink)"/>
+          <rect x="28" y="27" width="19" height="5" rx="2.5" style="fill:var(--ink);opacity:.7"/>
+          <rect x="9" y="39" width="34" height="5" rx="2.5" style="fill:var(--ink);opacity:.7"/>
+          <rect x="9" y="51" width="27" height="5" rx="2.5" style="fill:var(--ink);opacity:.3"/>
+        </svg>
+        <span><b>Lecture adaptée</b><small>Le texte remis en forme : police, taille, thème et mode focus à ton goût.</small></span>
+      </button>
+      <button type="button" class="mode-opt" data-mode="original">
+        <svg class="thumb" viewBox="0 0 56 70" aria-hidden="true">
+          <rect x="5" y="2" width="46" height="66" rx="3" style="fill:#fff;stroke:var(--line)"/>
+          <rect x="11" y="9" width="24" height="3" rx="1" style="fill:#59636e"/>
+          <rect x="11" y="17" width="34" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="22" width="34" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="27" width="34" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="32" width="20" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="22" y="30.5" width="10" height="5" rx="1" style="fill:rgba(255,206,0,.75);stroke:#d9a400;stroke-width:.6"/>
+          <rect x="11" y="40" width="34" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="45" width="34" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="50" width="28" height="2" rx="1" style="fill:#a3abb4"/>
+          <rect x="11" y="57" width="14" height="6" rx="1" style="fill:#d5dae0"/>
+        </svg>
+        <span><b>PDF original</b><small>Les pages telles quelles, avec une boîte jaune sur le mot lu.</small></span>
+      </button>
+    </div>
+    <label class="sw-row"><span>Retenir mon choix</span><span class="switch"><input type="checkbox" id="choiceRemember"><i></i></span></label>
+    <p class="sec-note" style="margin-top:2px">Tu peux changer à tout moment avec le bouton en haut de l’écran.</p>
   </div>
 </div>
 

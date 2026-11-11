@@ -80,6 +80,7 @@ const DEFAULTS = {
   hlWord: true, hlSentence: true, autoScroll: true, focus: false, dimRead: true, tapToRead: true, wakeLock: true,
   ocrLangs: ['fra', 'eng'],
   noticeDismissed: false,
+  pdfOpen: 'ask', pdfZoom: 1,
 };
 const S = (() => {
   const base = JSON.parse(JSON.stringify(DEFAULTS));
@@ -358,9 +359,11 @@ function wordsOf(u) {
 }
 function unwrapWords(u) { if (u && u.words) { u.el.textContent = u.text; u.words = null; } }
 
+const isOriginal = () => !!(doc && doc.origin && doc.mode === 'original');
+
 function setActive(i, { scroll = true, force = false } = {}) {
   if (!doc || !doc.units[i]) return;
-  if (activeI === i) { if (force) ensureVisible(doc.units[i].el, true); return; }
+  if (activeI === i) { if (force) { const r = anchorRect(i); if (r) ensureRectVisible(r, true); } return; }
   const prev = activeI >= 0 ? doc.units[activeI] : null;
   if (prev) { prev.el.classList.remove('active'); unwrapWords(prev); }
   const u = doc.units[i];
@@ -377,8 +380,9 @@ function setActive(i, { scroll = true, force = false } = {}) {
   u.el.classList.add('active');
   P.wordIdx = -1;
   hideMarker();
+  if (isOriginal()) origSentence(i);
   updateProgress();
-  if (scroll) ensureVisible(u.el, force);
+  if (scroll) { const r = anchorRect(i); if (r) ensureRectVisible(r, force); }
 }
 
 function hideMarker() { el.marker.style.opacity = '0'; }
@@ -396,6 +400,7 @@ function placeMarker(w) {
 function highlightChar(ch) {
   const u = doc && doc.units[activeI];
   if (!u || !S.hlWord) return;
+  if (isOriginal()) { origWord(u, ch); return; }
   const words = wordsOf(u);
   if (!words.length) return;
   let k = words.findIndex((w) => w.end > ch);
@@ -409,6 +414,7 @@ function highlightChar(ch) {
   }
 }
 function refreshMarker() {
+  if (isOriginal()) return;
   const u = doc && doc.units[activeI];
   if (u && u.words && P.wordIdx >= 0 && S.hlWord && u.words[P.wordIdx]) placeMarker(u.words[P.wordIdx].el);
   else hideMarker();
@@ -418,10 +424,19 @@ function refreshMarker() {
 let userScrollAt = 0;
 const topHeight = () => (el.readerTop ? el.readerTop.offsetHeight : 56);
 const playerHeight = () => (el.player.hidden ? 0 : el.player.offsetHeight + (innerWidth >= 820 ? 16 : 0));
-function ensureVisible(node, force = false) {
-  if (!node || (!force && !S.autoScroll)) return;
+function anchorRect(i) {
+  const u = doc && doc.units[i];
+  if (!u) return null;
+  if (isOriginal()) {
+    const first = u.boxes && u.boxes.find(Boolean);
+    return first ? boxRect(first[0]) : null;
+  }
+  return u.el.getBoundingClientRect();
+}
+function ensureVisible(node, force = false) { if (node) ensureRectVisible(node.getBoundingClientRect(), force); }
+function ensureRectVisible(r, force = false) {
+  if (!r || (!force && !S.autoScroll)) return;
   if (!force && Date.now() - userScrollAt < 5000) { updateReturnPill(); return; }
-  const r = node.getBoundingClientRect();
   const top = topHeight() + 12;
   const bottom = innerHeight - playerHeight() - 16;
   const band = Math.max(80, bottom - top);
@@ -429,14 +444,277 @@ function ensureVisible(node, force = false) {
     const target = scrollY + r.top - (top + band * 0.22);
     window.scrollTo({ top: Math.max(0, target), behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   }
+  if (isOriginal()) hScrollInto(r);
   el.returnPill.hidden = true;
 }
 function updateReturnPill() {
   if (!doc || el.reader.hidden || editing || activeI < 0 || P.state === 'idle') { el.returnPill.hidden = true; return; }
-  const r = doc.units[activeI].el.getBoundingClientRect();
+  const r = anchorRect(activeI);
+  if (!r) { el.returnPill.hidden = true; return; }
   const off = r.bottom < topHeight() || r.top > innerHeight - playerHeight();
   el.returnPill.hidden = !off;
 }
+
+/* ============================================================
+   Original view: PDF pages / images with the yellow word box
+   ============================================================ */
+const PV = { origin: null, io: null, mark: null, sents: [], queue: Promise.resolve() };
+const normTok = (t) => String(t).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+
+/* Map every word of the (cleaned) text to its box on the original pages. */
+function alignOrigin(d) {
+  const W = d.origin.words;
+  const pageIndex = d.origin.pages.map(() => []);
+  let j = 0, fails = 0;
+  for (const u of d.units) {
+    const toks = u.text.match(/\S+/g) || [];
+    u.boxes = new Array(toks.length).fill(null);
+    toks.forEach((tok, k) => {
+      const n = normTok(tok);
+      if (!n) return;
+      const win = n.length >= 6 ? (fails > 6 ? 400 : 80) : n.length >= 4 ? 30 : 8;
+      let found = -1, span = 1;
+      for (let look = 0; look < win && j + look < W.length && found < 0; look++) {
+        let cat = '';
+        for (let s2 = 0; s2 < 4 && j + look + s2 < W.length; s2++) {
+          cat += W[j + look + s2].n; // a word cut by a hyphen or split in pieces by the PDF
+          if (cat === n) { found = j + look; span = s2 + 1; break; }
+          if (!n.startsWith(cat)) break;
+        }
+      }
+      if (found < 0) { fails++; return; }
+      fails = 0;
+      const boxes = W.slice(found, found + span);
+      u.boxes[k] = boxes;
+      for (const b of boxes) pageIndex[b.p].push({ i: u.i, b });
+      j = found + span;
+    });
+  }
+  d.pageIndex = pageIndex;
+}
+
+function buildOriginal() {
+  const o = doc.origin;
+  const view = $('#pdfView');
+  if (PV.origin === o && view.childElementCount) return;
+  teardownOriginalView();
+  PV.origin = o;
+  o.pages.forEach((pg, p) => {
+    const d = document.createElement('div');
+    d.className = 'pg';
+    d.dataset.p = p;
+    d.style.aspectRatio = `${pg.w} / ${pg.h}`;
+    if (pg.kind === 'img') {
+      const img = document.createElement('img');
+      img.src = pg.url; img.alt = ''; img.decoding = 'async'; img.draggable = false;
+      d.append(img);
+    } else {
+      pg.canvas = document.createElement('canvas');
+      d.append(pg.canvas);
+    }
+    const hl = document.createElement('div');
+    hl.className = 'pg-hl';
+    d.append(hl);
+    pg.el = d; pg.hl = hl; pg.renderedW = 0; pg.want = false;
+    view.append(d);
+  });
+  PV.mark = document.createElement('div');
+  PV.mark.className = 'pmark';
+  if ('IntersectionObserver' in window) {
+    PV.io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const pg = o.pages[+e.target.dataset.p];
+        if (pg.kind !== 'pdf') continue;
+        if (e.isIntersecting) schedRender(pg); else releasePage(pg);
+      }
+    }, { rootMargin: '1200px 0px' });
+    o.pages.forEach((pg) => { if (pg.kind === 'pdf') PV.io.observe(pg.el); });
+  } else o.pages.forEach((pg) => { if (pg.kind === 'pdf') schedRender(pg); });
+}
+function teardownOriginalView() {
+  if (PV.io) PV.io.disconnect();
+  PV.io = null;
+  if (PV.origin) {
+    for (const pg of PV.origin.pages) {
+      if (pg.task) { try { pg.task.cancel(); } catch (e) { /* ignore */ } }
+      pg.el = null; pg.hl = null; pg.canvas = null; pg.renderedW = 0; pg.want = false;
+    }
+  }
+  PV.origin = null; PV.sents = []; PV.mark = null;
+  $('#pdfView').textContent = '';
+}
+function disposeOrigin(o) {
+  if (!o) return;
+  if (PV.origin === o) teardownOriginalView();
+  for (const pdf of o.pdfs) { try { pdf.destroy(); } catch (e) { /* ignore */ } }
+  for (const pg of o.pages) if (pg.url) URL.revokeObjectURL(pg.url);
+}
+function schedRender(pg) {
+  pg.want = true;
+  PV.queue = PV.queue.then(() => (pg.want ? renderOrigPage(pg) : null)).catch(() => {});
+}
+function releasePage(pg) {
+  pg.want = false;
+  if (pg.task) { try { pg.task.cancel(); } catch (e) { /* ignore */ } }
+  if (pg.canvas && pg.renderedW) { pg.canvas.width = 0; pg.canvas.height = 0; pg.renderedW = 0; }
+}
+async function renderOrigPage(pg) {
+  if (!pg.el || !PV.origin) return;
+  const cssW = pg.el.clientWidth;
+  if (!cssW) return;
+  const ratio = pg.h / pg.w;
+  let target = Math.round(cssW * Math.min(window.devicePixelRatio || 1, 2.5));
+  if (target * target * ratio > 6e6) target = Math.floor(Math.sqrt(6e6 / ratio)); // iOS canvas memory
+  if (Math.abs(pg.renderedW - target) < 2) return;
+  const page = await PV.origin.pdfs[pg.pdf].getPage(pg.num);
+  const vp = page.getViewport({ scale: target / pg.w });
+  const off = document.createElement('canvas');
+  off.width = Math.floor(vp.width); off.height = Math.floor(vp.height);
+  const ctx = off.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, off.width, off.height);
+  pg.task = page.render({ canvasContext: ctx, viewport: vp });
+  try { await pg.task.promise; } catch (e) { pg.task = null; return; }
+  pg.task = null;
+  if (!pg.want || !pg.canvas) return;
+  pg.canvas.width = off.width; pg.canvas.height = off.height;
+  pg.canvas.getContext('2d').drawImage(off, 0, 0);
+  off.width = 0;
+  pg.renderedW = target;
+}
+const rerenderOriginal = debounce(() => {
+  if (!PV.origin) return;
+  for (const pg of PV.origin.pages) if (pg.kind === 'pdf' && pg.want) schedRender(pg);
+}, 250);
+
+function setBoxStyle(n, b, padX, padY) {
+  n.style.left = `calc(${b.x * 100}% - ${padX}px)`;
+  n.style.top = `calc(${b.y * 100}% - ${padY}px)`;
+  n.style.width = `calc(${b.w * 100}% + ${padX * 2}px)`;
+  n.style.height = `calc(${b.h * 100}% + ${padY * 2}px)`;
+}
+function boxRect(b) {
+  const pg = PV.origin && PV.origin.pages[b.p];
+  if (!pg || !pg.el) return null;
+  const r = pg.el.getBoundingClientRect();
+  return { top: r.top + b.y * r.height, bottom: r.top + (b.y + b.h) * r.height, left: r.left + b.x * r.width, right: r.left + (b.x + b.w) * r.width };
+}
+function hScrollInto(r) {
+  const sc = $('#pdfScroll');
+  if (!sc || sc.scrollWidth <= sc.clientWidth + 2) return;
+  const s = sc.getBoundingClientRect();
+  if (r.left < s.left + 12 || r.right > s.right - 12) {
+    sc.scrollTo({ left: sc.scrollLeft + (r.left - s.left) - s.width * 0.3, behavior: reducedMotion.matches ? 'auto' : 'smooth' });
+  }
+}
+function hidePMark() { if (PV.mark) PV.mark.style.opacity = '0'; }
+function placePMark(b) {
+  const pg = PV.origin && PV.origin.pages[b.p];
+  if (!pg || !pg.hl || !PV.mark) return;
+  const m = PV.mark;
+  if (m.parentNode !== pg.hl) {
+    m.style.transition = 'none';
+    pg.hl.append(m);
+    setBoxStyle(m, b, 3, 2);
+    void m.offsetWidth;
+    m.style.transition = '';
+  } else setBoxStyle(m, b, 3, 2);
+  m.style.opacity = '1';
+}
+function origSentence(i) {
+  for (const n of PV.sents) n.remove();
+  PV.sents = [];
+  hidePMark();
+  const u = doc && doc.units[i];
+  if (!u || !u.boxes || !PV.origin || !S.hlSentence) return;
+  const lines = [];
+  for (const b of u.boxes.filter(Boolean).flat()) {
+    const L = lines[lines.length - 1];
+    if (L && L.p === b.p && Math.abs((L.y + L.h / 2) - (b.y + b.h / 2)) < Math.max(L.h, b.h) * 0.6 && b.x >= L.x - 0.02) {
+      const x1 = Math.max(L.x + L.w, b.x + b.w), y1 = Math.max(L.y + L.h, b.y + b.h);
+      L.x = Math.min(L.x, b.x); L.y = Math.min(L.y, b.y); L.w = x1 - L.x; L.h = y1 - L.y;
+    } else lines.push({ p: b.p, x: b.x, y: b.y, w: b.w, h: b.h });
+  }
+  for (const L of lines) {
+    const pg = PV.origin.pages[L.p];
+    if (!pg.hl) continue;
+    const n = document.createElement('div');
+    n.className = 'psent';
+    setBoxStyle(n, L, 3, 2);
+    pg.hl.prepend(n);
+    PV.sents.push(n);
+  }
+}
+function origWord(u, ch) {
+  unitWeights(u);
+  let k = 0;
+  while (k < u.wstarts.length - 1 && u.wstarts[k + 1] <= ch) k++;
+  if (k === P.wordIdx) return;
+  P.wordIdx = k;
+  const bs = u.boxes && u.boxes[k];
+  if (!bs) return; // word not found on the page: the box stays on the previous one
+  placePMark(bs[0]);
+  const r = boxRect(bs[0]);
+  if (r && S.autoScroll) {
+    const bottom = innerHeight - playerHeight() - 24;
+    if (r.bottom > bottom || r.top < topHeight() + 8) ensureRectVisible(r);
+    else if (Date.now() - userScrollAt > 5000) hScrollInto(r);
+  }
+}
+function refreshOriginalMarks() {
+  if (!isOriginal() || activeI < 0) return;
+  origSentence(activeI);
+  const u = doc.units[activeI], k = P.wordIdx;
+  if (S.hlWord && u && k >= 0 && u.boxes && u.boxes[k]) placePMark(u.boxes[k][0]);
+}
+function setMode(mode, { scroll = true } = {}) {
+  if (!doc) return;
+  if (mode === 'original' && !doc.origin) mode = 'reader';
+  doc.mode = mode;
+  updateModeBtn();
+  if (editing) return;
+  const orig = mode === 'original';
+  el.docWrap.hidden = orig;
+  $('#pdfScroll').hidden = !orig;
+  hideMarker();
+  if (orig) buildOriginal();
+  requestAnimationFrame(() => {
+    if (orig) refreshOriginalMarks(); else refreshMarker();
+    if (scroll && activeI >= 0) { const r = anchorRect(activeI); if (r) ensureRectVisible(r, true); }
+  });
+}
+function updateModeBtn() {
+  const b = $('#modeBtn');
+  const has = !!(doc && doc.origin);
+  b.hidden = !has || editing;
+  if (!has) return;
+  const orig = doc.mode === 'original';
+  const what = doc.origin.pdfs.length ? 'le PDF original' : 'l’image originale';
+  const label = orig ? 'Passer à la lecture adaptée' : `Voir ${what}`;
+  b.innerHTML = `<svg class="i" aria-hidden="true"><use href="#i-${orig ? 'reader' : 'file'}"/></svg>`;
+  b.setAttribute('aria-label', label);
+  b.title = label;
+}
+function askMode() {
+  return new Promise((resolve) => {
+    const box = $('#choice');
+    const rem = $('#choiceRemember');
+    rem.checked = false;
+    box.hidden = false;
+    const done = (mode) => {
+      box.hidden = true;
+      box.removeEventListener('click', onClick);
+      removeEventListener('keydown', onKey, true);
+      if (rem.checked) { S.pdfOpen = mode; save(); }
+      resolve(mode);
+    };
+    const onClick = (e) => { const b = e.target.closest('[data-mode]'); if (b) done(b.dataset.mode); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); done('reader'); } };
+    box.addEventListener('click', onClick);
+    addEventListener('keydown', onKey, true);
+    setTimeout(() => { const c = box.querySelector('.choice-card'); if (c) c.focus(); }, 60);
+  });
+}
+
 ['wheel', 'touchmove'].forEach((ev) => addEventListener(ev, () => { userScrollAt = Date.now(); }, { passive: true }));
 let scrollRaf = 0;
 addEventListener('scroll', () => {
@@ -1080,6 +1358,7 @@ async function importFiles(list) {
   cancelImport = false;
   showBusy('Préparation…');
   const parts = [];
+  const origin = { pages: [], pdfs: [], words: [] };
   let title = '';
   try {
     for (let k = 0; k < files.length; k++) {
@@ -1087,32 +1366,37 @@ async function importFiles(list) {
       const tag = files.length > 1 ? ` (${k + 1}/${files.length})` : '';
       if (!title && f.name) title = f.name.replace(/\.[^.]+$/, '');
       if (isPDF(f)) {
-        const r = await readPDF(f, tag);
+        const r = await readPDF(f, tag, origin);
         if (r.title && weakTitle(title)) title = r.title;
         parts.push(...r.pages);
-      } else if (isImage(f)) parts.push(await ocrImage(f, `Reconnaissance du texte${tag}`));
+      } else if (isImage(f)) parts.push(await ocrImage(f, `Reconnaissance du texte${tag}`, origin));
       else if (isText(f)) parts.push(await f.text());
       else toast(`Format non pris en charge : ${f.name || 'fichier'}`);
       if (cancelImport) throw CANCELLED;
     }
   } catch (err) {
     hideBusy();
+    disposeOrigin(origin);
     if (err !== CANCELLED && !cancelImport) { console.error(err); toast((err && err.message) || 'Impossible de lire ce fichier.', 5000); }
     return;
   }
   hideBusy();
   const paras = cleanText(parts.filter(Boolean).join('\n\n'));
-  if (!paras.length) { toast('Aucun texte trouvé. Essaie une image plus nette, ou recadre sur le texte.', 5000); return; }
-  openDoc(paras, weakTitle(title) ? '' : title);
+  if (!paras.length) { disposeOrigin(origin); toast('Aucun texte trouvé. Essaie une image plus nette, ou recadre sur le texte.', 5000); return; }
+  let mode = 'reader';
+  if (origin.pdfs.length) mode = S.pdfOpen === 'ask' ? await askMode() : S.pdfOpen;
+  openDoc(paras, weakTitle(title) ? '' : title, origin.pages.length ? origin : null, mode);
 }
 
-async function readPDF(file, tag) {
+async function readPDF(file, tag, origin) {
   setBusy(`Ouverture du PDF${tag}`, '', null);
   await loadScript(LIBS.pdf);
   const lib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
   if (!lib) throw new Error('Le lecteur PDF n’a pas pu se charger.');
   lib.GlobalWorkerOptions.workerSrc = LIBS.pdfWorker;
   const pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
+  const pdfIndex = origin.pdfs.length;
+  origin.pdfs.push(pdf); // kept open for the original view
   let title = '';
   try { const meta = await pdf.getMetadata(); title = (meta && meta.info && meta.info.Title) || ''; } catch (e) { /* none */ }
   const pages = [];
@@ -1120,16 +1404,77 @@ async function readPDF(file, tag) {
     if (cancelImport) throw CANCELLED;
     setBusy(`Lecture du PDF${tag}`, `Page ${n} sur ${pdf.numPages}`, (n - 1) / pdf.numPages);
     const page = await pdf.getPage(n);
-    let text = pageText(await page.getTextContent());
+    const vp = page.getViewport({ scale: 1 });
+    const tc = await page.getTextContent();
+    let text = pageText(tc);
+    let words;
     if (text.replace(/\s/g, '').length < 25) {
       const canvas = await renderPage(page);
-      text = await ocrCanvas(canvas, `Reconnaissance du PDF${tag}`, `Page scannée ${n} sur ${pdf.numPages}`, n - 1, pdf.numPages);
-    }
+      const r = await ocrCanvas(canvas, `Reconnaissance du PDF${tag}`, `Page scannée ${n} sur ${pdf.numPages}`, n - 1, pdf.numPages);
+      text = r.text; words = r.words;
+    } else words = pageWords(tc, vp);
+    addOriginPage(origin, { kind: 'pdf', pdf: pdfIndex, num: n, w: vp.width, h: vp.height }, words);
     pages.push(text);
     page.cleanup();
   }
-  await pdf.destroy();
   return { pages: stripRunningLines(pages), title: title.trim() };
+}
+function addOriginPage(origin, page, words) {
+  const p = origin.pages.length;
+  origin.pages.push(page);
+  for (const w of words) {
+    const n = normTok(w.t);
+    if (n) origin.words.push({ p, x: w.x, y: w.y, w: w.w, h: w.h, n });
+  }
+}
+let measureCtx = null, measureFam = '';
+function measureW(str, fam = 'sans-serif') {
+  if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+  if (fam !== measureFam) { measureFam = fam; measureCtx.font = `100px ${fam}`; }
+  return measureCtx.measureText(str).width;
+}
+const matMul = (m, n) => [
+  m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+];
+/* word boxes of a text PDF page, as fractions of the page size */
+function pageWords(tc, vp) {
+  const out = [];
+  for (const it of tc.items) {
+    if (!('str' in it) || !/\S/.test(it.str || '')) continue;
+    const tx = matMul(vp.transform, it.transform);
+    if (Math.abs(Math.atan2(tx[1], tx[0])) > 0.02) continue; // rotated text
+    const fh = Math.hypot(tx[2], tx[3]) || 10;
+    const x0 = tx[4], base = tx[5];
+    const st = (tc.styles && tc.styles[it.fontName]) || {};
+    const fam = /^(serif|sans-serif|monospace)$/.test(st.fontFamily) ? st.fontFamily : 'sans-serif';
+    const asc = st.ascent > 0.5 && st.ascent < 1.2 ? st.ascent : 0.82;
+    const desc = st.descent < 0 && st.descent > -0.5 ? -st.descent : 0.24;
+    const str = it.str;
+    const totalW = (it.width || 0) * vp.scale;
+    const full = measureW(str, fam);
+    const k = full > 0 && totalW > 0 ? totalW / full : 0;
+    const re = /\S+/g;
+    let m;
+    while ((m = re.exec(str))) {
+      let x, w;
+      if (k) { x = x0 + measureW(str.slice(0, m.index), fam) * k; w = measureW(m[0], fam) * k; }
+      else { const cw = (totalW || fh * 0.5 * str.length) / str.length; x = x0 + m.index * cw; w = m[0].length * cw; }
+      out.push({ t: m[0], x: x / vp.width, y: (base - fh * asc) / vp.height, w: w / vp.width, h: (fh * (asc + desc)) / vp.height });
+    }
+  }
+  return out;
+}
+function ocrWords(data, cw, ch) {
+  let words = data && data.words;
+  if (!words || !words.length) {
+    words = [];
+    for (const b of (data && data.blocks) || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) words.push(w);
+  }
+  return words.filter((w) => w && w.bbox && w.text).map((w) => ({
+    t: w.text, x: w.bbox.x0 / cw, y: w.bbox.y0 / ch, w: (w.bbox.x1 - w.bbox.x0) / cw, h: (w.bbox.y1 - w.bbox.y0) / ch,
+  }));
 }
 function pageText(tc) {
   let out = '', lastY = null, lastH = 0, lastEnd = null;
@@ -1199,8 +1544,8 @@ async function ocrCanvas(canvas, title, sub, k = 0, n = 1) {
   try {
     const w = await getTess();
     if (cancelImport) throw CANCELLED;
-    const { data } = await w.recognize(canvas);
-    return (data && data.text) || '';
+    const { data } = await w.recognize(canvas, {}, { text: true, blocks: true, hocr: false, tsv: false });
+    return { text: (data && data.text) || '', words: ocrWords(data, canvas.width, canvas.height) };
   } finally { tessProgress = null; }
 }
 async function loadBitmap(file) {
@@ -1234,11 +1579,13 @@ async function prepareImage(file) {
   ctx.putImageData(img, 0, 0);
   return c;
 }
-async function ocrImage(file, title) {
+async function ocrImage(file, title, origin) {
   setBusy(title, 'Préparation de l’image…', null);
   const canvas = await prepareImage(file);
   if (cancelImport) throw CANCELLED;
-  return ocrCanvas(canvas, title, '');
+  const r = await ocrCanvas(canvas, title, '');
+  addOriginPage(origin, { kind: 'img', url: URL.createObjectURL(file), w: canvas.width, h: canvas.height }, r.words);
+  return r.text;
 }
 
 function openFromText(text, title = '') {
@@ -1271,15 +1618,21 @@ async function pasteFromClipboard() {
 /* ============================================================
    Views
    ============================================================ */
-let editing = false;
-function openDoc(paras, title) {
+let editing = false, editNew = false;
+function openDoc(paras, title, origin = null, mode = 'reader') {
+  const prevOrigin = doc && doc.origin;
   stopAll();
   activeI = -1;
   doc = buildDoc(paras, title);
+  if (prevOrigin && prevOrigin !== origin) disposeOrigin(prevOrigin);
+  doc.origin = origin;
+  doc.mode = origin ? mode : 'reader';
+  if (origin) alignOrigin(doc);
   renderDoc();
   P.i = 0; P.wordIdx = -1;
   closeEditor(false, true);
   showReader();
+  setMode(doc.mode, { scroll: false });
   setActive(0, { scroll: false });
   window.scrollTo(0, 0);
   $('#docTitle').textContent = doc.title;
@@ -1319,8 +1672,11 @@ addEventListener('popstate', () => { if (!el.reader.hidden) showHome(); });
 function openEditor(initial) {
   pause();
   editing = true;
+  editNew = initial != null;
   if (el.reader.hidden) showReader();
   el.docWrap.hidden = true;
+  $('#pdfScroll').hidden = true;
+  updateModeBtn();
   el.notice.hidden = true;
   el.player.hidden = true;
   el.returnPill.hidden = true;
@@ -1334,17 +1690,17 @@ function closeEditor(apply, silent) {
   const text = el.editText.value;
   editing = false;
   el.editor.hidden = true;
-  el.docWrap.hidden = false;
   el.player.hidden = false;
+  if (doc) setMode(doc.mode, { scroll: false }); else el.docWrap.hidden = false;
   measurePlayer();
   if (silent) return;
   if (apply) {
     const keep = P.i;
     const paras = cleanText(text);
     if (!paras.length) { toast('Le texte est vide.'); if (!doc) showHome(); return; }
-    const hadDoc = !!doc;
-    openDoc(paras, hadDoc && doc.title ? doc.title : '');
-    if (hadDoc && keep > 0) goTo(Math.min(keep, doc.units.length - 1), false);
+    const reuse = !!doc && !editNew;
+    openDoc(paras, reuse && doc.title ? doc.title : '', reuse ? doc.origin : null, reuse ? doc.mode : 'reader');
+    if (reuse && keep > 0) goTo(Math.min(keep, doc.units.length - 1), false);
   } else if (!doc) showHome();
   else updateNotice();
 }
@@ -1378,12 +1734,16 @@ function applyView() {
   r.style.setProperty('--fs', `${S.fontSize}px`);
   r.style.setProperty('--lh', String(S.lineHeight));
   r.style.setProperty('--measure', `${S.width}px`);
+  r.style.setProperty('--pz', String(S.pdfZoom));
+  if (PV.origin) rerenderOriginal();
   r.style.setProperty('--read-font', S.font === 'sans' ? 'var(--sans)' : S.font === 'hyper' ? 'var(--hyper)' : 'var(--serif)');
   el.doc.classList.toggle('hl-sent', !!S.hlSentence);
   el.doc.classList.toggle('dim', !!S.dimRead);
   el.doc.classList.toggle('focus', !!S.focus);
   requestAnimationFrame(() => {
     refreshMarker();
+    refreshOriginalMarks();
+    if (!S.hlWord) hidePMark();
     const bg = getComputedStyle(document.body).backgroundColor;
     $$('meta[name="theme-color"]').forEach((m) => m.setAttribute('content', bg));
   });
@@ -1404,8 +1764,9 @@ const FMT = {
   fontSize: (x) => `${x} px`,
   lineHeight: (x) => fmtNum(x),
   width: (x) => `${x} px`,
+  pdfZoom: (x) => `${Math.round(x * 100)} %`,
 };
-const LIVE_ON_INPUT = new Set(['rate', 'pitch', 'volume', 'pauseSentence', 'pauseParagraph', 'fontSize', 'lineHeight', 'width']);
+const LIVE_ON_INPUT = new Set(['rate', 'pitch', 'volume', 'pauseSentence', 'pauseParagraph', 'fontSize', 'lineHeight', 'width', 'pdfZoom']);
 
 function segHTML(key, options, cur) {
   return `<div class="seg" role="group">${options.map(([v, label]) => `<button type="button" data-seg="${key}" data-val="${esc(v)}" aria-pressed="${String(v) === String(cur)}">${esc(label)}</button>`).join('')}</div>`;
@@ -1507,6 +1868,10 @@ function viewTabHTML() {
     ${rangeHTML('fontSize', 'Taille', 15, 34, 1, S.fontSize)}
     ${rangeHTML('lineHeight', 'Interligne', 1.3, 2.3, 0.05, S.lineHeight)}
     ${innerWidth > 760 ? rangeHTML('width', 'Largeur de colonne', 480, 960, 20, S.width) : ''}</div>
+    <div class="sec"><p class="sec-title">PDF</p>
+    <p class="sec-note" style="margin:0 0 8px">Ouvrir les PDF en</p>
+    ${segHTML('pdfOpen', [['ask', 'Demander'], ['reader', 'Adaptée'], ['original', 'Original']], S.pdfOpen)}
+    ${rangeHTML('pdfZoom', 'Zoom des pages originales', 1, 3, 0.1, S.pdfZoom)}</div>
     <div class="sec"><p class="sec-title">Pendant la lecture</p>
     ${switchHTML('hlWord', 'Surligner le mot lu')}
     ${switchHTML('hlSentence', 'Surligner la phrase')}
@@ -1522,6 +1887,7 @@ function viewTabHTML() {
       <span><kbd>Maj</kbd> + <kbd>←</kbd> <kbd>→</kbd></span><span>Paragraphe précédent / suivant</span>
       <span><kbd>+</kbd> <kbd>−</kbd></span><span>Vitesse</span>
       <span><kbd>F</kbd></span><span>Mode focus</span>
+      <span><kbd>O</kbd></span><span>PDF original / lecture adaptée</span>
       <span><kbd>V</kbd></span><span>Réglages de la voix</span></div></div>`;
   }
   return h;
@@ -1731,6 +2097,26 @@ on('homeSettings', 'click', () => openSheet('view'));
 on('backBtn', 'click', () => { if (history.state && history.state.reader) history.back(); else showHome(); });
 on('editBtn', 'click', () => (editing ? closeEditor(false) : openEditor()));
 on('viewBtn', 'click', () => openSheet('view'));
+on('modeBtn', 'click', (e) => { blurIfMouse(e); if (doc) setMode(doc.mode === 'original' ? 'reader' : 'original'); });
+/* tap a word on the original page */
+$('#pdfView').addEventListener('click', (e) => {
+  if (!S.tapToRead || !doc || !doc.pageIndex) return;
+  const pgEl = e.target.closest('.pg');
+  if (!pgEl) return;
+  const p = +pgEl.dataset.p, pg = doc.origin.pages[p];
+  const r = pgEl.getBoundingClientRect();
+  const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+  const asp = pg.h / pg.w;
+  let best = null, bd = Infinity;
+  for (const it of doc.pageIndex[p] || []) {
+    const b = it.b;
+    const dx = fx < b.x ? b.x - fx : fx > b.x + b.w ? fx - (b.x + b.w) : 0;
+    const dy = (fy < b.y ? b.y - fy : fy > b.y + b.h ? fy - (b.y + b.h) : 0) * asp;
+    const d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = it; }
+  }
+  if (best && bd < 0.0016) { userScrollAt = 0; goTo(best.i, true); }
+});
 on('editDone', 'click', () => closeEditor(true));
 on('editCancel', 'click', () => closeEditor(false));
 on('busyCancel', 'click', async () => {
@@ -1810,6 +2196,7 @@ addEventListener('keydown', (e) => {
     case '-': case '_': setRate(S.rate - 0.1); toast(`Vitesse ${fmtNum(S.rate)}×`, 1200); break;
     case 'f': case 'F': setSetting('focus', !S.focus); toast(S.focus ? 'Mode focus activé' : 'Mode focus désactivé', 1400); break;
     case 'v': case 'V': openSheet('voice'); break;
+    case 'o': case 'O': if (doc.origin) setMode(doc.mode === 'original' ? 'reader' : 'original'); break;
     default: break;
   }
 });
@@ -1855,7 +2242,7 @@ $('#ocrLangs').addEventListener('click', (e) => {
 });
 
 /* resize */
-const onResize = debounce(() => { measurePlayer(); refreshMarker(); }, 120);
+const onResize = debounce(() => { measurePlayer(); refreshMarker(); rerenderOriginal(); }, 120);
 addEventListener('resize', onResize);
 if (window.ResizeObserver) new ResizeObserver(() => refreshMarker()).observe(el.doc);
 if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => refreshMarker());
